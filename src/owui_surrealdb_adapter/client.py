@@ -186,7 +186,27 @@ class SurrealDBClient:
 
         Handles simple equality and $in operator (audit bug #3).
         """
-        raise NotImplementedError("Phase 4: filter translation")
+        parts: list[str] = []
+        for i, (key, value) in enumerate(filter_dict.items()):
+            pname = f"{prefix}{i}"
+            if isinstance(value, dict) and "$in" in value:
+                params[pname] = value["$in"]
+                parts.append(f"metadata.{key} IN ${pname}")
+            else:
+                params[pname] = value
+                parts.append(f"metadata.{key} = ${pname}")
+        return parts
+
+    @staticmethod
+    def _extract_record_key(record_id: Any) -> str:
+        """Extract the key portion from a SurrealDB record ID.
+
+        'table:key' → 'key', RecordID → str(key)
+        """
+        s = str(record_id)
+        if ":" in s:
+            return s.split(":", 1)[1]
+        return s
 
     # -- VectorDBBase interface (7 methods) ---------------------------------
 
@@ -195,7 +215,27 @@ class SurrealDBClient:
 
         Uses INFO FOR TABLE to verify idx_vector exists (audit bug #2 fix).
         """
-        raise NotImplementedError("Phase 4: has_collection")
+        if not self.client:
+            return False
+        try:
+            table = self._prefixed(collection_name)
+            response = self.client.query_raw(f"INFO FOR TABLE `{table}`;")
+
+            # Check for top-level error
+            if response.get("error"):
+                return False
+
+            results = response.get("result", [])
+            if not results:
+                return False
+
+            info = results[0].get("result", {})
+            if isinstance(info, dict) and "indexes" in info:
+                return "idx_vector" in info["indexes"]
+            return False
+        except Exception as e:
+            log.debug("has_collection('%s') exception: %s", collection_name, e)
+            return False
 
     def search(
         self,
@@ -208,7 +248,61 @@ class SurrealDBClient:
 
         Handles $in filters (audit bug #3) and batch vectors (audit bug #5).
         """
-        raise NotImplementedError("Phase 4: search")
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+
+        all_ids: list[list[str]] = []
+        all_distances: list[list[float]] = []
+        all_documents: list[list[str]] = []
+        all_metadatas: list[list[dict]] = []
+
+        for qv in vectors:
+            params: dict[str, Any] = {"qv": qv}
+
+            # Build WHERE clause from filters
+            where_parts: list[str] = []
+            if filter:
+                where_parts = self._build_filter(filter, params)
+
+            where_clause = ""
+            if where_parts:
+                where_clause = "WHERE " + " AND ".join(where_parts) + " "
+
+            query = (
+                f"SELECT *, vector::distance::cosine(embedding, $qv) AS dist "
+                f"FROM `{table}` "
+                f"{where_clause}"
+                f"ORDER BY embedding <|{limit},{self.config.ef_search}|> $qv "
+                f"LIMIT {limit};"
+            )
+
+            results = self._execute_query(query, params)
+            rows = results[0] if results else []
+
+            ids: list[str] = []
+            distances: list[float] = []
+            documents: list[str] = []
+            metadatas: list[dict] = []
+
+            for row in (rows or []):
+                ids.append(self._extract_record_key(row.get("id", "")))
+                # Cosine distance → similarity: 1 - distance
+                dist = row.get("dist", 0.0)
+                distances.append(1.0 - dist)
+                documents.append(row.get("content", ""))
+                metadatas.append(row.get("metadata", {}))
+
+            all_ids.append(ids)
+            all_distances.append(distances)
+            all_documents.append(documents)
+            all_metadatas.append(metadatas)
+
+        return SearchResult(
+            ids=all_ids,
+            distances=all_distances,
+            documents=all_documents,
+            metadatas=all_metadatas,
+        )
 
     def upsert(
         self,
@@ -218,12 +312,67 @@ class SurrealDBClient:
         """Insert or update vector records.
 
         Uses INSERT ... ON DUPLICATE KEY UPDATE via _execute_query().
+        Auto-creates collection if it doesn't exist.
         """
-        raise NotImplementedError("Phase 4: upsert")
+        self._ensure_connected()
+
+        if not items:
+            return
+
+        # Auto-create collection if needed
+        if not self.has_collection(collection_name):
+            dimension = len(items[0].get("vector", []))
+            if dimension > 0:
+                self._create_collection(collection_name, dimension)
+
+        table = self._prefixed(collection_name)
+
+        # Build records for INSERT
+        records = []
+        for item in items:
+            records.append({
+                "id": item["id"],
+                "content": item.get("text", ""),
+                "embedding": item.get("vector", []),
+                "metadata": item.get("metadata", {}),
+            })
+
+        params = {"data": records}
+        query = (
+            f"INSERT INTO `{table}` $data "
+            f"ON DUPLICATE KEY UPDATE "
+            f"content = $input.content, "
+            f"embedding = $input.embedding, "
+            f"metadata = $input.metadata;"
+        )
+
+        self._execute_query(query, params)
 
     def get(self, collection_name: str) -> Optional[GetResult]:
         """Retrieve all items from a collection."""
-        raise NotImplementedError("Phase 4: get")
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+
+        results = self._execute_query(f"SELECT * FROM `{table}`;")
+        rows = results[0] if results else []
+
+        if not rows:
+            return None
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+
+        for row in rows:
+            ids.append(self._extract_record_key(row.get("id", "")))
+            documents.append(row.get("content", ""))
+            metadatas.append(row.get("metadata", {}))
+
+        return GetResult(
+            ids=[ids],
+            documents=[documents],
+            metadatas=[metadatas],
+        )
 
     def delete(
         self,
@@ -235,12 +384,44 @@ class SurrealDBClient:
 
         Uses record IDs directly, not metadata.id (audit bug #4 fix).
         """
-        raise NotImplementedError("Phase 4: delete")
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+
+        if ids:
+            # Delete by record ID — O(1) per record
+            stmts = [f"DELETE `{table}`:`{id_val}`;" for id_val in ids]
+            self._execute_query(" ".join(stmts))
+        elif filter:
+            params: dict[str, Any] = {}
+            where_parts = self._build_filter(filter, params)
+            where_clause = " AND ".join(where_parts)
+            self._execute_query(
+                f"DELETE FROM `{table}` WHERE {where_clause};", params
+            )
 
     def delete_collection(self, collection_name: str) -> None:
         """Drop an entire collection table."""
-        raise NotImplementedError("Phase 4: delete_collection")
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+        self._execute_query(f"REMOVE TABLE `{table}`;")
+        log.info("Deleted collection '%s' (table=%s)", collection_name, table)
 
     def reset(self) -> None:
         """Drop all tables with the configured prefix."""
-        raise NotImplementedError("Phase 4: reset")
+        self._ensure_connected()
+
+        # Get all tables in the database
+        results = self._execute_query("INFO FOR DB;")
+        db_info = results[0] if results else {}
+
+        tables = db_info.get("tables", {}) if isinstance(db_info, dict) else {}
+
+        # Filter to only tables with our prefix
+        prefixed = [t for t in tables if t.startswith(self.config.table_prefix)]
+
+        if not prefixed:
+            return
+
+        stmts = [f"REMOVE TABLE `{t}`;" for t in prefixed]
+        self._execute_query(" ".join(stmts))
+        log.info("Reset: removed %d tables with prefix '%s'", len(prefixed), self.config.table_prefix)
