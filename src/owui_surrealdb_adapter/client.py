@@ -1,9 +1,9 @@
-"""SurrealDB adapter implementing Open WebUI's VectorDBBase interface."""
-
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
+
+from pydantic import BaseModel
 
 from owui_surrealdb_adapter.config import SurrealDBConfig
 
@@ -12,58 +12,42 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Open WebUI result types (mirrors open_webui.retrieval.vector.main)
+# Must be Pydantic BaseModels — OWUI calls .model_dump() on them.
 # ---------------------------------------------------------------------------
 
-class SearchResult:
-    """Vector search result container.
-
-    Open WebUI expects:
-        ids: list[list[str]]
-        distances: list[list[float]]
-        documents: list[list[str]]
-        metadatas: list[list[dict]]
-    All double-nested (outer = per query vector, inner = per result).
-    """
-
-    def __init__(
-        self,
-        ids: list[list[str]],
-        distances: list[list[float]],
-        documents: list[list[str]],
-        metadatas: list[list[dict]],
-    ):
-        self.ids = ids
-        self.distances = distances
-        self.documents = documents
-        self.metadatas = metadatas
+class SearchResult(BaseModel):
+    """Vector search result container."""
+    ids: Optional[list[list[str]]] = None
+    distances: Optional[list[list[float]]] = None
+    documents: Optional[list[list[str]]] = None
+    metadatas: Optional[list[list[Any]]] = None
 
 
-class GetResult:
-    """Collection get result container.
+class GetResult(BaseModel):
+    """Collection get result container."""
+    ids: Optional[list[list[str]]] = None
+    documents: Optional[list[list[str]]] = None
+    metadatas: Optional[list[list[Any]]] = None
 
-    Open WebUI expects:
-        ids: list[list[str]]
-        documents: list[list[str]]
-        metadatas: list[list[dict]]
-    All double-nested.
-    """
 
-    def __init__(
-        self,
-        ids: list[list[str]],
-        documents: list[list[str]],
-        metadatas: list[list[dict]],
-    ):
-        self.ids = ids
-        self.documents = documents
-        self.metadatas = metadatas
+def _is_not_found(exc: Exception) -> bool:
+    """Check if an exception is a SurrealDB 'table not found' error."""
+    cls = type(exc).__name__
+    return cls == "NotFoundError" or "does not exist" in str(exc)
 
 
 class SurrealDBClient:
     """SurrealDB vector database adapter for Open WebUI.
 
-    Implements the VectorDBBase interface (7 methods).
-    Uses _execute_query() for safe multi-statement execution.
+    Implements the VectorDBBase interface (9 methods):
+        has_collection, delete_collection, insert, upsert,
+        search, query, get, delete, reset
+
+    Method signatures match VectorDBBase EXACTLY — parameter order matters
+    because the AsyncVectorDBClient wrapper calls positionally.
+
+    All read/delete methods gracefully handle non-existent tables by
+    returning None (reads) or no-op (deletes) instead of raising.
     """
 
     def __init__(self, config: Optional[SurrealDBConfig] = None) -> None:
@@ -164,7 +148,7 @@ class SurrealDBClient:
             f"DEFINE TABLE OVERWRITE `{table}` SCHEMAFULL",
             f"DEFINE FIELD OVERWRITE content ON `{table}` TYPE string",
             f"DEFINE FIELD OVERWRITE embedding ON `{table}` TYPE array<float>",
-            f"DEFINE FIELD OVERWRITE metadata ON `{table}` FLEXIBLE TYPE object",
+            f"DEFINE FIELD OVERWRITE metadata ON `{table}` TYPE object FLEXIBLE",
             f"DEFINE FIELD OVERWRITE created_at ON `{table}` TYPE datetime DEFAULT time::now()",
             index_def,
         ]) + ";"
@@ -202,13 +186,19 @@ class SurrealDBClient:
         """Extract the key portion from a SurrealDB record ID.
 
         'table:key' → 'key', RecordID → str(key)
+        Also strips SurrealDB's ⟨⟩ bracket wrapping for IDs with special chars.
         """
         s = str(record_id)
         if ":" in s:
-            return s.split(":", 1)[1]
+            s = s.split(":", 1)[1]
+        # Strip ⟨⟩ brackets that SurrealDB adds for IDs with hyphens/special chars
+        if s.startswith("⟨") and s.endswith("⟩"):
+            s = s[1:-1]
         return s
 
-    # -- VectorDBBase interface (7 methods) ---------------------------------
+    # -- VectorDBBase interface (9 methods) ---------------------------------
+    # IMPORTANT: Parameter order MUST match VectorDBBase exactly.
+    # The AsyncVectorDBClient wrapper calls these positionally.
 
     def has_collection(self, collection_name: str) -> bool:
         """Check if a collection exists and has a vector index.
@@ -237,72 +227,29 @@ class SurrealDBClient:
             log.debug("has_collection('%s') exception: %s", collection_name, e)
             return False
 
-    def search(
-        self,
-        collection_name: str,
-        vectors: list[list[float]],
-        limit: int,
-        filter: Optional[dict] = None,
-    ) -> Optional[SearchResult]:
-        """KNN vector search with optional metadata filters.
-
-        Handles $in filters (audit bug #3) and batch vectors (audit bug #5).
-        """
+    def delete_collection(self, collection_name: str) -> None:
+        """Drop an entire collection table."""
         self._ensure_connected()
         table = self._prefixed(collection_name)
+        try:
+            self._execute_query(f"REMOVE TABLE IF EXISTS `{table}`;")
+        except Exception as e:
+            if _is_not_found(e):
+                return
+            raise
+        log.info("Deleted collection '%s' (table=%s)", collection_name, table)
 
-        all_ids: list[list[str]] = []
-        all_distances: list[list[float]] = []
-        all_documents: list[list[str]] = []
-        all_metadatas: list[list[dict]] = []
+    def insert(
+        self,
+        collection_name: str,
+        items: list[dict],
+    ) -> None:
+        """Insert vector items into a collection.
 
-        for qv in vectors:
-            params: dict[str, Any] = {"qv": qv}
-
-            # Build WHERE clause from filters
-            where_parts: list[str] = []
-            if filter:
-                where_parts = self._build_filter(filter, params)
-
-            where_clause = ""
-            if where_parts:
-                where_clause = "WHERE " + " AND ".join(where_parts) + " "
-
-            query = (
-                f"SELECT *, vector::distance::cosine(embedding, $qv) AS dist "
-                f"FROM `{table}` "
-                f"{where_clause}"
-                f"ORDER BY embedding <|{limit},{self.config.ef_search}|> $qv "
-                f"LIMIT {limit};"
-            )
-
-            results = self._execute_query(query, params)
-            rows = results[0] if results else []
-
-            ids: list[str] = []
-            distances: list[float] = []
-            documents: list[str] = []
-            metadatas: list[dict] = []
-
-            for row in (rows or []):
-                ids.append(self._extract_record_key(row.get("id", "")))
-                # Cosine distance → similarity: 1 - distance
-                dist = row.get("dist", 0.0)
-                distances.append(1.0 - dist)
-                documents.append(row.get("content", ""))
-                metadatas.append(row.get("metadata", {}))
-
-            all_ids.append(ids)
-            all_distances.append(distances)
-            all_documents.append(documents)
-            all_metadatas.append(metadatas)
-
-        return SearchResult(
-            ids=all_ids,
-            distances=all_distances,
-            documents=all_documents,
-            metadatas=all_metadatas,
-        )
+        Delegates to upsert() — SurrealDB's INSERT ON DUPLICATE KEY UPDATE
+        handles both insert and update semantics.
+        """
+        self.upsert(collection_name, items)
 
     def upsert(
         self,
@@ -348,13 +295,133 @@ class SurrealDBClient:
 
         self._execute_query(query, params)
 
+    def search(
+        self,
+        collection_name: str,
+        vectors: list[list[float]],
+        filter: Optional[dict] = None,
+        limit: int = 10,
+    ) -> Optional[SearchResult]:
+        """KNN vector search with optional metadata filters.
+
+        Handles $in filters (audit bug #3) and batch vectors (audit bug #5).
+
+        NOTE: param order is (vectors, filter, limit) to match VectorDBBase.
+        The async wrapper calls positionally — wrong order = silent bugs.
+        """
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+
+        all_ids: list[list[str]] = []
+        all_distances: list[list[float]] = []
+        all_documents: list[list[str]] = []
+        all_metadatas: list[list[dict]] = []
+
+        for qv in vectors:
+            params: dict[str, Any] = {"qv": qv}
+
+            # Build filter parts for WHERE clause
+            where_parts: list[str] = []
+            if filter:
+                where_parts = self._build_filter(filter, params)
+
+            query = (
+                f"SELECT *, vector::distance::knn() AS dist "
+                f"FROM `{table}` "
+                f"WHERE embedding <|{limit},{self.config.ef_search}|> $qv "
+                f"{('AND ' + ' AND '.join(where_parts) + ' ') if where_parts else ''}"
+                f"LIMIT {limit};"
+            )
+
+            try:
+                results = self._execute_query(query, params)
+                rows = results[0] if results else []
+            except Exception as e:
+                if _is_not_found(e):
+                    rows = []
+                else:
+                    raise
+
+            ids: list[str] = []
+            distances: list[float] = []
+            documents: list[str] = []
+            metadatas: list[dict] = []
+
+            for row in (rows or []):
+                ids.append(self._extract_record_key(row.get("id", "")))
+                # Cosine distance → similarity: 1 - distance
+                dist = row.get("dist", 0.0)
+                distances.append(1.0 - dist)
+                documents.append(row.get("content", ""))
+                metadatas.append(row.get("metadata", {}))
+
+            all_ids.append(ids)
+            all_distances.append(distances)
+            all_documents.append(documents)
+            all_metadatas.append(metadatas)
+
+        return SearchResult(
+            ids=all_ids,
+            distances=all_distances,
+            documents=all_documents,
+            metadatas=all_metadatas,
+        )
+
+    def query(
+        self,
+        collection_name: str,
+        filter: dict,
+        limit: Optional[int] = None,
+    ) -> Optional[GetResult]:
+        """Query vectors from a collection using metadata filters."""
+        self._ensure_connected()
+        table = self._prefixed(collection_name)
+
+        params: dict[str, Any] = {}
+        where_parts = self._build_filter(filter, params)
+        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        limit_clause = f" LIMIT {limit}" if limit else ""
+
+        query = f"SELECT * FROM `{table}` {where_clause}{limit_clause};"
+
+        try:
+            results = self._execute_query(query, params)
+            rows = results[0] if results else []
+        except Exception as e:
+            if _is_not_found(e):
+                return None
+            raise
+
+        if not rows:
+            return None
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+
+        for row in rows:
+            ids.append(self._extract_record_key(row.get("id", "")))
+            documents.append(row.get("content", ""))
+            metadatas.append(row.get("metadata", {}))
+
+        return GetResult(
+            ids=[ids],
+            documents=[documents],
+            metadatas=[metadatas],
+        )
+
     def get(self, collection_name: str) -> Optional[GetResult]:
         """Retrieve all items from a collection."""
         self._ensure_connected()
         table = self._prefixed(collection_name)
 
-        results = self._execute_query(f"SELECT * FROM `{table}`;")
-        rows = results[0] if results else []
+        try:
+            results = self._execute_query(f"SELECT * FROM `{table}`;")
+            rows = results[0] if results else []
+        except Exception as e:
+            if _is_not_found(e):
+                return None
+            raise
 
         if not rows:
             return None
@@ -383,28 +450,27 @@ class SurrealDBClient:
         """Delete records by primary key or filter.
 
         Uses record IDs directly, not metadata.id (audit bug #4 fix).
+        Gracefully handles non-existent tables.
         """
         self._ensure_connected()
         table = self._prefixed(collection_name)
 
-        if ids:
-            # Delete by record ID — O(1) per record
-            stmts = [f"DELETE `{table}`:`{id_val}`;" for id_val in ids]
-            self._execute_query(" ".join(stmts))
-        elif filter:
-            params: dict[str, Any] = {}
-            where_parts = self._build_filter(filter, params)
-            where_clause = " AND ".join(where_parts)
-            self._execute_query(
-                f"DELETE FROM `{table}` WHERE {where_clause};", params
-            )
-
-    def delete_collection(self, collection_name: str) -> None:
-        """Drop an entire collection table."""
-        self._ensure_connected()
-        table = self._prefixed(collection_name)
-        self._execute_query(f"REMOVE TABLE `{table}`;")
-        log.info("Deleted collection '%s' (table=%s)", collection_name, table)
+        try:
+            if ids:
+                # Delete by record ID — O(1) per record
+                stmts = [f"DELETE `{table}`:`{id_val}`;" for id_val in ids]
+                self._execute_query(" ".join(stmts))
+            elif filter:
+                params: dict[str, Any] = {}
+                where_parts = self._build_filter(filter, params)
+                where_clause = " AND ".join(where_parts)
+                self._execute_query(
+                    f"DELETE FROM `{table}` WHERE {where_clause};", params
+                )
+        except Exception as e:
+            if _is_not_found(e):
+                return
+            raise
 
     def reset(self) -> None:
         """Drop all tables with the configured prefix."""
