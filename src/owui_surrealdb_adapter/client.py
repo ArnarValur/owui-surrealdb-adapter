@@ -115,16 +115,69 @@ class SurrealDBClient:
 
         return [stmt.get("result") for stmt in results]
 
+    def _connect(self) -> None:
+        """Create a new connection to SurrealDB, authenticate, and select ns/db."""
+        from surrealdb import Surreal
+
+        surreal = Surreal(self.config.uri)
+        # Enter context manager — opens WebSocket or HTTP connection
+        conn = surreal.__enter__()
+        self._surreal_ctx = surreal  # keep reference to avoid GC closing it
+
+        conn.signin({"username": self.config.user, "password": self.config.password})
+        conn.use(self.config.namespace, self.config.database)
+        self.client = conn
+
+        log.info(
+            "Connected to SurrealDB at %s (ns=%s, db=%s)",
+            self.config.uri,
+            self.config.namespace,
+            self.config.database,
+        )
+
     def _ensure_connected(self) -> None:
         """Ensure a live connection to SurrealDB exists."""
-        raise NotImplementedError("Phase 3: connection lifecycle")
+        if self.client is None:
+            self._connect()
 
     def _create_collection(self, collection_name: str, dimension: int) -> None:
         """Create a SCHEMAFULL table with vector index.
 
         Uses DEFINE ... OVERWRITE for idempotency.
+        Generates a single multi-statement query for atomicity.
         """
-        raise NotImplementedError("Phase 3: schema management")
+        table = self._prefixed(collection_name)
+
+        # Build index definition based on config
+        if self.config.index_type == "diskann":
+            index_def = (
+                f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
+                f"FIELDS embedding DISKANN DIMENSION {dimension} DIST COSINE"
+            )
+        else:
+            index_def = (
+                f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
+                f"FIELDS embedding HNSW DIMENSION {dimension} DIST COSINE"
+            )
+
+        query = "; ".join([
+            f"DEFINE TABLE OVERWRITE `{table}` SCHEMAFULL",
+            f"DEFINE FIELD OVERWRITE content ON `{table}` TYPE string",
+            f"DEFINE FIELD OVERWRITE embedding ON `{table}` TYPE array<float>",
+            f"DEFINE FIELD OVERWRITE metadata ON `{table}` FLEXIBLE TYPE object",
+            f"DEFINE FIELD OVERWRITE created_at ON `{table}` TYPE datetime DEFAULT time::now()",
+            index_def,
+        ]) + ";"
+
+        self._execute_query(query)
+
+        log.info(
+            "Created collection '%s' (table=%s, dim=%d, index=%s)",
+            collection_name,
+            table,
+            dimension,
+            self.config.index_type,
+        )
 
     def _build_filter(
         self, filter_dict: dict, params: dict, prefix: str = "fv"
