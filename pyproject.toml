@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "owui-surrealdb-adapter"
+version = "2.0.0"
+description = "SurrealDB vector database adapter for Open WebUI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Arnar Valur", email = "arnar@merkurial-studio.com" },
+]
+dependencies = [
+    "surrealdb>=2.0.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/owui_surrealdb_adapter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["owui_surrealdb_adapter"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
