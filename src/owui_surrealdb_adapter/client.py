@@ -91,8 +91,29 @@ class SurrealDBClient:
 
         Uses query_raw() + per-statement status inspection to catch errors
         that the SDK's query() silently swallows (audit bug #1).
+
+        Returns:
+            List of results, one per statement in the query.
+
+        Raises:
+            SurrealError: On RPC/transport errors or any statement failure.
         """
-        raise NotImplementedError("Phase 2: safe query executor")
+        from surrealdb.errors import parse_query_error, parse_rpc_error
+
+        response = self.client.query_raw(query, params)
+
+        # Check for top-level RPC/transport error first
+        error = response.get("error")
+        if error is not None:
+            raise parse_rpc_error(error)
+
+        # Inspect every statement result — the SDK only checks [0]
+        results = response.get("result", [])
+        for idx, stmt in enumerate(results):
+            if stmt.get("status") == "ERR":
+                raise parse_query_error(stmt)
+
+        return [stmt.get("result") for stmt in results]
 
     def _ensure_connected(self) -> None:
         """Ensure a live connection to SurrealDB exists."""
