@@ -7,14 +7,15 @@
 services:
   surrealdb:
     image: surrealdb/surrealdb:v3.1
+    user: root
     command: start --user root --pass root --bind 0.0.0.0:8000 rocksdb:/data/db
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     volumes:
       - surrealdb-data:/data/db
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "surreal", "isready", "--conn", "http://localhost:8000"]
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://localhost:8000"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -24,7 +25,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "3000:8080"
+      - "3001:8080"
     environment:
       # Vector DB — SurrealDB
       - VECTOR_DB=surrealdb
