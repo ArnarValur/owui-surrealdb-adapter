@@ -1,6 +1,6 @@
 # E2E Testing Checklist — owui-surrealdb-adapter
 
-> Open WebUI at **http://localhost:3000**
+> Open WebUI at **<http://localhost:3000>**
 > SurrealDB at **ws://localhost:8000**
 >
 > Check each box as you go. Note any failures inline.
@@ -51,22 +51,30 @@
 
 ---
 
-## 4. Reconnection / Resilience
+## 4. Reconnection / Resilience ✅
 
-- [ ] **Restart SurrealDB mid-session**:
+- [x] **Restart SurrealDB mid-session**:
+
   ```bash
   docker restart pluto-surrealdb
   ```
+
   Wait 10s, then upload a file. Expect: adapter reconnects, upload succeeds.
-- [ ] **Kill and restart SurrealDB**:
+  - ✅ Tested: restart at 12:31, SurrealDB back running, no errors in OWUI logs. Upload + RAG query worked.
+- [x] **Kill and restart SurrealDB**:
+
   ```bash
   docker stop pluto-surrealdb && sleep 5 && docker start pluto-surrealdb
   ```
+
   Then ask a RAG question. Expect: works after reconnect (may take ~5s).
-- [ ] **Check logs** for reconnection messages:
+  - ✅ Tested: cold stop at 12:32:03, started at 12:32:08. Silent reconnect, clean logs.
+- [x] **Check logs** for reconnection messages:
+
   ```bash
   docker logs pluto-open-webui 2>&1 | grep -i "reconnect\|transport\|retry"
   ```
+  - ✅ Tested: no error/panic logs. `_execute_with_retry()` + `_force_reconnect()` handled it silently.
 
 ---
 
@@ -102,34 +110,44 @@
 
 ---
 
-## 8. Embedding Model Change
+## 8. Embedding Model Change ✅
 
-- [ ] **Note the current embedding model** in OWUI settings (Admin → Settings → Documents)
-- [ ] **Change the embedding model** to a different one (different dimension)
-- [ ] **Upload a new file** after changing
+- [x] **Note the current embedding model** in OWUI settings (Admin → Settings → Documents)
+  - ✅ Was: `sentence-transformers/all-MiniLM-L6-v2` (384d, CPU)
+- [x] **Change the embedding model** to a different one (different dimension)
+  - ✅ Switched to: `embeddinggemma` via Ollama (768d, 300M params)
+- [x] **Upload a new file** after changing
   - Expect: new table created with correct new dimension
-- [ ] **Query across old + new files** — may fail (dimension mismatch is expected)
+  - ✅ Tested: 52 files uploaded to new KB "Testing 1", all embedded with 768d vectors, content viewable
+- [x] **Query across old + new files** — may fail (dimension mismatch is expected)
   - Note: this is a known limitation, just verify it doesn't crash silently
+  - ✅ Tested: retrieval works for new embeddings. Old 384d tables remain untouched. No crashes.
 
 ---
 
-## 9. OWUI Restart Persistence
+## 9. OWUI Restart Persistence ✅
 
-- [ ] **Restart OWUI container**:
+- [x] **Restart OWUI container**:
+
   ```bash
   docker restart pluto-open-webui
   ```
-- [ ] **Verify existing Knowledge Bases still show files**
-- [ ] **Ask a RAG question** — should work without re-indexing
-- [ ] **Upload a new file** — should work without manual intervention
+  - ✅ Tested: restarted at 12:32:35, serving requests by 12:32:45
+- [x] **Verify existing Knowledge Bases still show files**
+  - ✅ Tested: KB endpoints returning 200 immediately after restart, files listed
+- [x] **Ask a RAG question** — should work without re-indexing
+  - ✅ Tested: local model retrieved from collection after restart — no re-indexing needed
+- [x] **Upload a new file** — should work without manual intervention
+  - ✅ Tested: works cleanly
 
 ---
 
-## 10. Concurrent Users (if applicable)
+## 10. Concurrent Users ✅
 
-- [ ] **Open two browser tabs**, both logged in
-- [ ] **Upload a file in Tab 1** while **asking a RAG question in Tab 2**
+- [x] **Open two browser tabs**, both logged in
+- [x] **Upload a file in Tab 1** while **asking a RAG question in Tab 2**
   - Expect: both operations succeed (thread safety test)
+  - ✅ Tested: two separate users (admin + valur) on two browsers, two different models (nemotron-3-nano:4b-bf16 + gemini-3.5-flash), querying same UnixplorationBuddy collection simultaneously. Both retrieved 2 sources with correct citations. Thread safety confirmed.
 
 ---
 
