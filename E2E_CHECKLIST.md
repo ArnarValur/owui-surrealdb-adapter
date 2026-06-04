@@ -4,39 +4,50 @@
 > SurrealDB at **ws://localhost:8000**
 >
 > Check each box as you go. Note any failures inline.
+>
+> **Last run: 2026-06-04 ~12:20 CEST by Arnar**
 
 ---
 
-## 1. Basic RAG Pipeline (Happy Path)
+## 1. Basic RAG Pipeline (Happy Path) ✅
 
-- [ ] **Upload a small .md file** (~1 page) to a Knowledge Base
+- [x] **Upload a small .md file** (~1 page) to a Knowledge Base
   - Expect: green toast, no errors in `docker logs pluto-open-webui`
-- [ ] **Ask a question** about the uploaded content
+  - ✅ Tested: uploaded multiple .md files, all green toast, no errors
+- [x] **Ask a question** about the uploaded content
   - Expect: RAG-augmented answer with citation link
-- [ ] **Upload a .txt file** — verify non-markdown works too
-- [ ] **Upload a .pdf file** — verify PDF parsing + embedding works
+  - ✅ Tested: retrieved 3 sources on first query, 2 different sources on follow-up (smart retrieval)
+- [x] **Upload a .txt file** — verify non-markdown works too
+  - ✅ Tested: .txt files retrievable
+- [x] **Upload a .pdf file** — verify PDF parsing + embedding works
+  - ✅ Tested: 6MB Carl Jung PDF uploaded, parsed into 1,784 chunks, referenced correctly in chat
+- [x] **Upload into KB folder** — OWUI 0.9.6 folder feature
+  - ✅ Tested: created folder within KB, uploaded PDF inside it, chat referenced it correctly
 
 ---
 
-## 2. Delete Flows
+## 2. Delete Flows ✅
 
-- [ ] **Delete a single file** from Knowledge Base UI
-  - Then verify chunks removed: `docker exec pluto-surrealdb /surreal sql --endpoint http://localhost:8000 --username root --password root --namespace owui --database vectors "INFO FOR DB;"` — the `owui_file-{id}` table should be gone
-- [ ] **Delete an entire Knowledge Base**
-  - Verify all associated tables removed from SurrealDB
-- [ ] **Re-upload the same file** after deleting it
-  - Expect: works without errors, new chunks created
+- [x] **Delete a single file** from Knowledge Base UI
+  - ✅ Tested: KB-level collection removed. Per-file cache tables persist by OWUI design (reuse for re-adding without re-embedding)
+- [x] **Delete an entire Knowledge Base**
+  - ✅ Tested: deleted 4 KBs. Verified via SDB query — KB-level UUID collections gone (0 remaining), per-file caches kept by design
+- [x] **Re-upload the same file** after deleting it
+  - ✅ Tested: works without errors, new chunks created
+
+> **Note:** OWUI intentionally keeps `owui_file-*` tables after KB delete. These are embedding caches so files can be re-added to another KB without re-embedding. This matches Chroma/Qdrant behavior.
 
 ---
 
-## 3. Multi-KB Isolation
+## 3. Multi-KB Isolation ✅
 
-- [ ] **Create Knowledge Base A** — upload `fileA.md`
-- [ ] **Create Knowledge Base B** — upload `fileB.md` (different content)
-- [ ] **Ask a question** using only KB-A → should NOT cite KB-B content
-- [ ] **Ask a question** using only KB-B → should NOT cite KB-A content
-- [ ] **Delete KB-A** → verify KB-B is untouched
-- [ ] **Query KB-B** after deleting KB-A → still works
+- [x] **Create Knowledge Base A** — upload `fileA.md`
+- [x] **Create Knowledge Base B** — upload `fileB.md` (different content)
+- [x] **Ask a question** using only KB-A → should NOT cite KB-B content
+- [x] **Ask a question** using only KB-B → should NOT cite KB-A content
+- [x] **Delete KB-A** → verify KB-B is untouched
+- [x] **Query KB-B** after deleting KB-A → still works
+  - ✅ All isolation tests passed
 
 ---
 
@@ -59,35 +70,35 @@
 
 ---
 
-## 5. Large Documents
+## 5. Large Documents ✅
 
-- [ ] **Upload a large file** (50+ pages / 100KB+)
-  - Expect: no timeout, chunks stored correctly
-  - Verify chunk count: `docker exec pluto-surrealdb /surreal sql --endpoint http://localhost:8000 --username root --password root --namespace owui --database vectors "SELECT count() FROM owui_file-{FILE_ID} GROUP ALL;"`
-- [ ] **Ask a question** about content near the END of the large file
-  - Expect: correct answer (verifies all chunks were indexed, not just first batch)
-
----
-
-## 6. Rapid Operations (Stress)
-
-- [ ] **Upload 3 files quickly** in succession (don't wait for each to finish)
-  - Expect: all 3 succeed, no connection race conditions
-- [ ] **Upload then immediately delete** the same file
-  - Expect: no crash, clean state
-- [ ] **Upload, delete, re-upload** the same file
-  - Expect: works without "duplicate key" or stale data errors
+- [x] **Upload a large file** (50+ pages / 100KB+)
+  - ✅ Tested: 6MB Carl Jung PDF → 1,784 chunks stored correctly, no timeout
+  - Verified via SDB: `owui_file-6ee71cc9: 1784 chunks`
+- [x] **Ask a question** about content near the END of the large file
+  - ✅ Tested: content referenced correctly, all chunks indexed
 
 ---
 
-## 7. Edge Case: Special Characters
+## 6. Rapid Operations (Stress) ✅
 
-- [ ] **Upload a file with unicode filename** (e.g. `résumé.md` or `日本語.txt`)
-  - Expect: works or clean error, no crash
-- [ ] **Upload a file with very long name** (100+ chars)
-  - Expect: works or clean error
-- [ ] **Upload a file with empty content**
-  - Expect: no crash (may produce 0 chunks — that's ok)
+- [x] **Upload 3 files quickly** in succession (don't wait for each to finish)
+  - ✅ Tested: 9 .md files uploaded straight into a chat — all succeeded. Then 52 files mass-uploaded into "UnixplorationBuddy" KB — all succeeded, fast. SDB inspection: 70 file tables, 3,265 total chunks, no races.
+- [x] **Upload then immediately delete** the same file
+  - ✅ Tested: no crash, clean state
+- [x] **Upload, delete, re-upload** the same file
+  - ✅ Tested: re-uploaded entire UnixplorationBuddy vault folder after deletion — works without duplicate key or stale data errors
+
+---
+
+## 7. Edge Case: Special Characters ✅
+
+- [x] **Upload a file with unicode filename** (e.g. `résumé.md` or `日本語.txt`)
+  - ✅ Tested: Icelandic KB "Íslendingabók" with `Ólafur Liljurós.txt` containing Icelandic text — uploaded, embedded, and retrieved perfectly. "Ólafur reið með björgum fram" returned with correct citation.
+- [x] **Upload a file with very long name** (100+ chars)
+  - ✅ Tested: no issues
+- [x] **Upload a file with empty content**
+  - ✅ Tested: no crash
 
 ---
 
@@ -124,10 +135,7 @@
 
 ## Notes
 
-> Record any failures, unexpected behaviors, or observations here:
->
-> ```
->
->
->
-> ```
+> - OWUI 0.9.6 supports folders within KBs — tested and works with SurrealDB adapter
+> - Mass upload (52 files) completed without issues — adapter handles concurrent inserts cleanly
+> - Retrieval is smart: different queries pull different source subsets from the same KB
+> - Per-file table caching is by OWUI design, not an adapter leak
