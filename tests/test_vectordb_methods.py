@@ -116,9 +116,15 @@ class TestHasCollection:
         query = client.client.query_raw.call_args[0][0]
         assert "test_my_docs" in query
 
-    def test_returns_false_on_exception(self, client):
-        """Any exception → False (graceful degradation)."""
+    def test_raises_on_unexpected_exception(self, client):
+        """Non-'not found' exceptions now propagate (no silent masking)."""
         client.client.query_raw.side_effect = Exception("connection lost")
+        with pytest.raises(Exception, match="connection lost"):
+            client.has_collection("docs")
+
+    def test_returns_false_on_not_found_exception(self, client):
+        """'Does not exist' exceptions still return False gracefully."""
+        client.client.query_raw.side_effect = Exception("The table 'test_docs' does not exist")
         assert client.has_collection("docs") is False
 
 
@@ -335,17 +341,18 @@ class TestGet:
 class TestDelete:
 
     def test_delete_by_record_ids(self, client):
-        """Delete by IDs uses record ID directly, not metadata.id (bug #4 fix)."""
+        """Delete by IDs uses validated DELETE table:id syntax."""
         client.client.query_raw.return_value = {
             "result": [{"status": "OK", "result": None}] * 2
         }
 
         client.delete("docs", ids=["chunk1", "chunk2"])
 
+        # Should batch DELETE statements
+        assert client.client.query_raw.call_count == 1
         query = client.client.query_raw.call_args[0][0]
-        # Should use DELETE `table`:`id` format
-        assert "DELETE" in query
-        assert "test_docs" in query
+        assert "DELETE `test_docs`:`chunk1`" in query
+        assert "DELETE `test_docs`:`chunk2`" in query
         # Should NOT use metadata.id
         assert "metadata.id" not in query
 
@@ -370,6 +377,8 @@ class TestDelete:
         # Just verifying the delete call completes without error
         client.delete("docs", ids=["c1"])
         assert client.client.query_raw.called
+        query = client.client.query_raw.call_args[0][0]
+        assert "DELETE `test_docs`:`c1`" in query
 
 
 # ---------------------------------------------------------------------------

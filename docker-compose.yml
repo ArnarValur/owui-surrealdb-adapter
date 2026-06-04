@@ -8,7 +8,9 @@ services:
   surrealdb:
     image: surrealdb/surrealdb:v3.1
     user: root
-    command: start --user root --pass root --bind 0.0.0.0:8000 rocksdb:/data/db
+    env_file:
+      - .env
+    command: start --user ${SURREALDB_USER} --pass ${SURREALDB_PASS} --bind 0.0.0.0:8000 rocksdb:/data/db
     expose:
       - "8000"
     volumes:
@@ -26,14 +28,14 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3001:8080"
+    env_file:
+      - .env
     environment:
       # Vector DB — SurrealDB
       - VECTOR_DB=surrealdb
       - SURREALDB_URI=ws://surrealdb:8000/rpc
       - SURREALDB_NS=owui
       - SURREALDB_DB=vectors
-      - SURREALDB_USER=root
-      - SURREALDB_PASS=root
       - SURREALDB_TABLE_PREFIX=owui_
       - SURREALDB_INDEX_TYPE=hnsw
     volumes:
@@ -42,6 +44,12 @@ services:
       surrealdb:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
 
 volumes:
   surrealdb-data:
