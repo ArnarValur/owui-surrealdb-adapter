@@ -19,6 +19,12 @@ log = logging.getLogger(__name__)
 # Safe identifier pattern: alphanumeric, hyphens, underscores, dots
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
+# UUID v4 pattern — used to detect KB collection names
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
 # Safe metadata filter key pattern: alphanumeric + underscores only
 _SAFE_FILTER_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -401,18 +407,141 @@ class SurrealDBClient:
             log.error("has_collection('%s') unexpected error: %s", collection_name, e)
             raise
 
+    def _is_kb_collection(self, collection_name: str) -> bool:
+        """Check if a collection name looks like a KB collection (bare UUID).
+
+        KB collections are named by their UUID (e.g. 'dc56fa18-d3ef-...').
+        File collections start with 'file-', metadata is 'knowledge-bases',
+        and user memory starts with 'user-memory-'.
+        """
+        return bool(_UUID_RE.match(collection_name))
+
+    def _cascade_delete_file_tables(self, collection_name: str) -> list[str]:
+        """Find and drop file tables orphaned by deleting this KB collection.
+
+        1. Query the KB table for all distinct metadata.file_id values.
+        2. For each file_id, check if any OTHER KB collection also references it.
+        3. Drop unreferenced file tables.
+
+        Returns list of dropped table names.
+        """
+        table = self._prefixed(collection_name)
+        dropped: list[str] = []
+
+        # Step 1: Get all file_ids from the KB being deleted
+        try:
+            results = self._execute_with_retry(
+                f"SELECT array::distinct(metadata.file_id) AS file_ids FROM `{table}` GROUP ALL;"
+            )
+            rows = results[0] if results else []
+        except Exception as e:
+            if _is_not_found(e):
+                return dropped
+            raise
+
+        if not rows or not rows[0]:
+            return dropped
+
+        file_ids = rows[0].get("file_ids", [])
+        if not file_ids:
+            return dropped
+
+        # Filter out None/empty values
+        file_ids = [fid for fid in file_ids if fid]
+
+        log.info(
+            "Cascade delete: KB '%s' references %d file(s), checking for orphans...",
+            collection_name, len(file_ids),
+        )
+
+        # Step 2: Find all OTHER KB collections (UUID-named, not this one)
+        try:
+            db_results = self._execute_with_retry("INFO FOR DB;")
+            db_info = db_results[0] if db_results else {}
+        except Exception:
+            log.warning("Cascade delete: failed to list tables, skipping cascade.")
+            return dropped
+
+        all_tables = db_info.get("tables", {}) if isinstance(db_info, dict) else {}
+        prefix = self.config.table_prefix
+        other_kb_tables = [
+            t for t in all_tables
+            if t.startswith(prefix)
+            and t != table
+            and self._is_kb_collection(t[len(prefix):])
+        ]
+
+        # Step 3: For each file_id, check if referenced in any other KB
+        for file_id in file_ids:
+            try:
+                _validate_name(file_id, "file_id")
+            except ValueError:
+                continue  # Skip malformed file_ids
+
+            file_table = self._prefixed(f"file-{file_id}")
+
+            # Check if this file table even exists
+            if file_table not in all_tables:
+                continue
+
+            # Check if any other KB references this file
+            referenced = False
+            for other_table in other_kb_tables:
+                try:
+                    check = self._execute_with_retry(
+                        f"SELECT count() AS cnt FROM `{other_table}` "
+                        f"WHERE metadata.file_id = $fid GROUP ALL;",
+                        {"fid": file_id},
+                    )
+                    rows = check[0] if check else []
+                    if rows and rows[0].get("cnt", 0) > 0:
+                        referenced = True
+                        break
+                except Exception:
+                    continue  # Skip inaccessible tables
+
+            if not referenced:
+                try:
+                    self._execute_with_retry(f"REMOVE TABLE IF EXISTS `{file_table}`;")
+                    dropped.append(file_table)
+                    log.info("Cascade delete: dropped orphaned table '%s'", file_table)
+                except Exception as e:
+                    log.warning("Cascade delete: failed to drop '%s': %s", file_table, e)
+
+        if dropped:
+            log.info(
+                "Cascade delete: dropped %d orphaned file table(s) for KB '%s'",
+                len(dropped), collection_name,
+            )
+
+        return dropped
+
     def delete_collection(self, collection_name: str) -> None:
-        """Drop an entire collection table."""
+        """Drop an entire collection table.
+
+        When cascade_delete is enabled and the collection is a KB (UUID-named),
+        also drops orphaned per-file tables that are no longer referenced by
+        any other KB collection.
+        """
         self._ensure_connected()
         _validate_name(collection_name, "collection_name")
         table = self._prefixed(collection_name)
+
+        # Cascade: clean up orphaned file tables BEFORE dropping the KB table
+        cascaded: list[str] = []
+        if self.config.cascade_delete and self._is_kb_collection(collection_name):
+            cascaded = self._cascade_delete_file_tables(collection_name)
+
         try:
             self._execute_with_retry(f"REMOVE TABLE IF EXISTS `{table}`;")
         except Exception as e:
             if _is_not_found(e):
                 return
             raise
-        log.info("Deleted collection '%s' (table=%s)", collection_name, table)
+        log.info(
+            "Deleted collection '%s' (table=%s, cascaded=%d file tables)",
+            collection_name, table, len(cascaded),
+        )
 
     def insert(
         self,
@@ -686,3 +815,89 @@ class SurrealDBClient:
         stmts = [f"REMOVE TABLE `{t}`;" for t in prefixed]
         self._execute_with_retry(" ".join(stmts))
         log.info("Reset: removed %d tables with prefix '%s'", len(prefixed), self.config.table_prefix)
+
+    # -- Orphan cleanup (outside VectorDBBase interface) ---------------------
+
+    def purge_orphans(
+        self,
+        active_file_ids: set[str] | None = None,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Drop file tables not referenced by any KB collection.
+
+        Args:
+            active_file_ids: If provided, keep only these file tables.
+                If None, auto-discovers by scanning all KB collections
+                for metadata.file_id values.
+            dry_run: If True, return orphan list without dropping.
+
+        Returns:
+            List of dropped (or would-be-dropped) table names.
+        """
+        self._ensure_connected()
+
+        # Get all tables
+        results = self._execute_with_retry("INFO FOR DB;")
+        db_info = results[0] if results else {}
+        all_tables = db_info.get("tables", {}) if isinstance(db_info, dict) else {}
+
+        prefix = self.config.table_prefix
+        file_prefix = f"{prefix}file-"
+
+        # Find all file tables
+        file_tables = [t for t in all_tables if t.startswith(file_prefix)]
+        if not file_tables:
+            return []
+
+        # Determine active file IDs
+        if active_file_ids is None:
+            # Auto-discover: scan all KB collections for referenced file_ids
+            active_file_ids = set()
+            kb_tables = [
+                t for t in all_tables
+                if t.startswith(prefix)
+                and self._is_kb_collection(t[len(prefix):])
+            ]
+            for kb_table in kb_tables:
+                try:
+                    results = self._execute_with_retry(
+                        f"SELECT array::distinct(metadata.file_id) AS file_ids "
+                        f"FROM `{kb_table}` GROUP ALL;"
+                    )
+                    rows = results[0] if results else []
+                    if rows and rows[0]:
+                        for fid in rows[0].get("file_ids", []):
+                            if fid:
+                                active_file_ids.add(fid)
+                except Exception:
+                    continue
+
+        # Find orphans
+        orphans: list[str] = []
+        for table in file_tables:
+            file_id = table[len(file_prefix):]
+            if file_id not in active_file_ids:
+                orphans.append(table)
+
+        if not orphans:
+            log.info("purge_orphans: no orphaned file tables found.")
+            return []
+
+        if dry_run:
+            log.info(
+                "purge_orphans (dry run): found %d orphaned file table(s): %s",
+                len(orphans), orphans,
+            )
+            return orphans
+
+        # Drop orphans
+        for table in orphans:
+            try:
+                _validate_name(table, "table_name")
+                self._execute_with_retry(f"REMOVE TABLE IF EXISTS `{table}`;")
+                log.info("purge_orphans: dropped '%s'", table)
+            except Exception as e:
+                log.warning("purge_orphans: failed to drop '%s': %s", table, e)
+
+        log.info("purge_orphans: dropped %d orphaned file table(s).", len(orphans))
+        return orphans

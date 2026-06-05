@@ -40,6 +40,7 @@ class SurrealDBConfig:
     connect_timeout: int = field(default_factory=lambda: _positive_int("SURREALDB_CONNECT_TIMEOUT", "10"))
     max_retries: int = field(default_factory=lambda: _positive_int("SURREALDB_MAX_RETRIES", "3"))
     retry_backoff: float = field(default_factory=lambda: float(os.getenv("SURREALDB_RETRY_BACKOFF", "1.0")))
+    cascade_delete: bool = field(default_factory=lambda: os.getenv("SURREALDB_CASCADE_DELETE", "true").lower() in ("true", "1", "yes"))
 
     @classmethod
     def from_env(cls) -> SurrealDBConfig:
