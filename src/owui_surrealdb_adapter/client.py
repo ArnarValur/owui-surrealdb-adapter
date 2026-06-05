@@ -93,12 +93,29 @@ class GetResult(BaseModel):
     metadatas: Optional[list[list[Any]]] = None
 
 
+def _is_db_missing(exc: Exception) -> bool:
+    """Check if an exception indicates the namespace or database doesn't exist.
+
+    This happens when all tables are dropped — SurrealDB lazily removes the
+    database metadata, making the existing connection's USE context stale.
+    A reconnect will re-issue USE ns/db and auto-create the database.
+    """
+    msg = str(exc).lower()
+    return (
+        ("database" in msg and "does not exist" in msg)
+        or ("namespace" in msg and "does not exist" in msg)
+    )
+
+
 def _is_not_found(exc: Exception) -> bool:
     """Check if an exception is a SurrealDB 'table not found' error.
 
     Checks both the exception class name and message content for robustness
-    across SDK versions.
+    across SDK versions. Excludes database/namespace-level errors which
+    require reconnection (handled by _is_db_missing).
     """
+    if _is_db_missing(exc):
+        return False  # Don't swallow — needs reconnect, not a no-op
     cls = type(exc).__name__
     msg = str(exc).lower()
     return (
@@ -222,10 +239,11 @@ class SurrealDBClient:
                 self._ensure_connected()
                 return self._execute_query(query, params)
             except Exception as exc:
-                if _is_transport_error(exc):
+                if _is_transport_error(exc) or _is_db_missing(exc):
                     last_exc = exc
                     log.warning(
-                        "Transport error (attempt %d/%d): %s — reconnecting...",
+                        "%s (attempt %d/%d): %s — reconnecting...",
+                        "DB missing" if _is_db_missing(exc) else "Transport error",
                         attempt + 1,
                         self.config.max_retries + 1,
                         exc,
