@@ -303,37 +303,41 @@ class SurrealDBClient:
             self._connect()
 
     def _create_collection(self, collection_name: str, dimension: int) -> None:
-        """Create a SCHEMAFULL table with vector index.
+        """Create a SCHEMAFULL table, optionally with a vector index.
 
         Uses DEFINE ... OVERWRITE for idempotency.
         Generates a single multi-statement query for atomicity.
+
+        When dimension is 0, creates a metadata-only table without
+        embedding field or vector index (e.g. OWUI's 'knowledge-bases').
         """
         _validate_name(collection_name, "collection_name")
         table = self._prefixed(collection_name)
 
-        dim = _validate_limit(dimension)  # reuse int validation
-
-        # Build index definition based on config
-        if self.config.index_type == "diskann":
-            index_def = (
-                f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
-                f"FIELDS embedding DISKANN DIMENSION {dim} DIST COSINE"
-            )
-        else:
-            index_def = (
-                f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
-                f"FIELDS embedding HNSW DIMENSION {dim} DIST COSINE"
-            )
-
-        query = "; ".join([
+        stmts = [
             f"DEFINE TABLE OVERWRITE `{table}` SCHEMAFULL",
             f"DEFINE FIELD OVERWRITE content ON `{table}` TYPE string",
-            f"DEFINE FIELD OVERWRITE embedding ON `{table}` TYPE array<float>",
             f"DEFINE FIELD OVERWRITE metadata ON `{table}` TYPE object FLEXIBLE",
-            f"DEFINE FIELD OVERWRITE created_at ON `{table}` TYPE datetime DEFAULT time::now()",
-            index_def,
-        ]) + ";"
+        ]
 
+        if dimension > 0:
+            dim = _validate_limit(dimension)
+            stmts.append(
+                f"DEFINE FIELD OVERWRITE embedding ON `{table}` TYPE array<float>"
+            )
+            # Build index definition based on config
+            if self.config.index_type == "diskann":
+                stmts.append(
+                    f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
+                    f"FIELDS embedding DISKANN DIMENSION {dim} DIST COSINE"
+                )
+            else:
+                stmts.append(
+                    f"DEFINE INDEX OVERWRITE idx_vector ON `{table}` "
+                    f"FIELDS embedding HNSW DIMENSION {dim} DIST COSINE"
+                )
+
+        query = "; ".join(stmts) + ";"
         self._execute_with_retry(query)
 
         log.info(
@@ -341,7 +345,7 @@ class SurrealDBClient:
             collection_name,
             table,
             dimension,
-            self.config.index_type,
+            self.config.index_type if dimension > 0 else "none (metadata-only)",
         )
 
     def _build_filter(
@@ -393,9 +397,13 @@ class SurrealDBClient:
     # The AsyncVectorDBClient wrapper calls these positionally.
 
     def has_collection(self, collection_name: str) -> bool:
-        """Check if a collection exists and has a vector index.
+        """Check if a collection exists (with or without a vector index).
 
-        Uses INFO FOR TABLE to verify idx_vector exists (audit bug #2 fix).
+        Returns True if the table has been explicitly defined (SCHEMAFULL)
+        — either with a vector index (KB/file collections) or without
+        (metadata-only collections like 'knowledge-bases').
+
+        Uses INFO FOR TABLE to check for fields or indexes.
         Only catches table-not-found errors — network/auth errors propagate.
         """
         if not self.client:
@@ -414,9 +422,14 @@ class SurrealDBClient:
                 return False
 
             info = results[0].get("result", {})
-            if isinstance(info, dict) and "indexes" in info:
-                return "idx_vector" in info["indexes"]
-            return False
+            if not isinstance(info, dict):
+                return False
+
+            # A collection exists if it has a vector index OR explicitly
+            # defined fields (metadata-only tables have fields but no index)
+            has_index = "indexes" in info and "idx_vector" in info.get("indexes", {})
+            has_fields = bool(info.get("fields", {}))
+            return has_index or has_fields
         except Exception as e:
             if _is_not_found(e):
                 log.debug("has_collection('%s'): table not found", collection_name)
@@ -590,36 +603,48 @@ class SurrealDBClient:
         if not items:
             return
 
-        # Auto-create collection if needed
+        # Auto-create collection if needed (including metadata-only with dim=0)
         if not self.has_collection(collection_name):
             dimension = len(items[0].get("vector", []))
-            if dimension > 0:
-                self._create_collection(collection_name, dimension)
+            self._create_collection(collection_name, dimension)
 
         table = self._prefixed(collection_name)
+
+        # Detect if this is a metadata-only batch (no vectors)
+        has_vectors = any(item.get("vector") for item in items)
 
         # Build records for INSERT
         records = []
         for item in items:
             _validate_name(str(item["id"]), "item_id")
-            records.append({
+            record: dict[str, Any] = {
                 "id": item["id"],
                 "content": item.get("text", ""),
-                "embedding": item.get("vector", []),
                 "metadata": item.get("metadata", {}),
-            })
+            }
+            if has_vectors:
+                record["embedding"] = item.get("vector", [])
+            records.append(record)
 
         # Chunk large batches to prevent timeouts / OOM
         for i in range(0, len(records), _INSERT_BATCH_SIZE):
             batch = records[i : i + _INSERT_BATCH_SIZE]
             params = {"data": batch}
-            query = (
-                f"INSERT INTO `{table}` $data "
-                f"ON DUPLICATE KEY UPDATE "
-                f"content = $input.content, "
-                f"embedding = $input.embedding, "
-                f"metadata = $input.metadata;"
-            )
+            if has_vectors:
+                query = (
+                    f"INSERT INTO `{table}` $data "
+                    f"ON DUPLICATE KEY UPDATE "
+                    f"content = $input.content, "
+                    f"embedding = $input.embedding, "
+                    f"metadata = $input.metadata;"
+                )
+            else:
+                query = (
+                    f"INSERT INTO `{table}` $data "
+                    f"ON DUPLICATE KEY UPDATE "
+                    f"content = $input.content, "
+                    f"metadata = $input.metadata;"
+                )
             self._execute_with_retry(query, params)
 
     def search(
