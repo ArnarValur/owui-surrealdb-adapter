@@ -131,9 +131,9 @@ def _is_transport_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return (
         cls in ("ConnectionError", "WebSocketError", "TransportError", "BrokenPipeError")
-        or "connection" in msg and ("closed" in msg or "refused" in msg or "reset" in msg)
+        or ("connection" in msg and ("closed" in msg or "refused" in msg or "reset" in msg))
         or "broken pipe" in msg
-        or "websocket" in msg and "close" in msg
+        or ("websocket" in msg and "close" in msg)
     )
 
 
@@ -284,7 +284,9 @@ class SurrealDBClient:
         if self.client is not None:
             return
         with self._lock:
-            # Double-check after acquiring lock
+            # Double-check after acquiring lock — another thread may have
+            # connected (or close() may have run) between our first check
+            # and acquiring the lock.
             if self.client is None:
                 self._connect()
 
@@ -411,17 +413,9 @@ class SurrealDBClient:
         try:
             _validate_name(collection_name, "collection_name")
             table = self._prefixed(collection_name)
-            response = self.client.query_raw(f"INFO FOR TABLE `{table}`;")
+            results = self._execute_with_retry(f"INFO FOR TABLE `{table}`;")
 
-            # Check for top-level error
-            if response.get("error"):
-                return False
-
-            results = response.get("result", [])
-            if not results:
-                return False
-
-            info = results[0].get("result", {})
+            info = results[0] if results else {}
             if not isinstance(info, dict):
                 return False
 
@@ -820,9 +814,11 @@ class SurrealDBClient:
                 # underscores, dots only) preventing any injection.
                 for id_val in ids:
                     _validate_name(str(id_val), "record_id")
-                # Build batch DELETE using validated + ⟨⟩-quoted IDs
-                stmts = [f"DELETE `{table}`:`{id_val}`;" for id_val in ids]
-                self._execute_with_retry(" ".join(stmts))
+                # Batch deletes to prevent query size limits (same as upsert)
+                for i in range(0, len(ids), _INSERT_BATCH_SIZE):
+                    batch = ids[i : i + _INSERT_BATCH_SIZE]
+                    stmts = [f"DELETE `{table}`:`{id_val}`;" for id_val in batch]
+                    self._execute_with_retry(" ".join(stmts))
             elif filter:
                 params: dict[str, Any] = {}
                 where_parts = self._build_filter(filter, params)
