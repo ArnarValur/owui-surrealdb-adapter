@@ -1,0 +1,4 @@
+# conductor/.gitignore — local convenience files, never committed
+docs/keys/
+*.env
+.obsidian/

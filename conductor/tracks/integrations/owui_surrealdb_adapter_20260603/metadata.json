@@ -1,0 +1,9 @@
+{
+  "track_id": "owui_surrealdb_adapter_20260603",
+  "type": "feature",
+  "status": "completed",
+  "domain": "integrations",
+  "created_at": "2026-06-03T23:40:00+02:00",
+  "updated_at": "2026-06-04T21:27:00+02:00",
+  "description": "Rewrite owui-surrealdb-adapter as a standalone pip package with Docker overlay integration for Open WebUI. Fix all 5 audit bugs, target SurrealDB 3.1, test on PlutoII before Saturn deployment."
+}
