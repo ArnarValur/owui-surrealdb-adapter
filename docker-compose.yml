@@ -6,7 +6,7 @@
 
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v3.1
+    image: surrealdb/surrealdb:v3.2.4
     user: root
     env_file:
       - .env

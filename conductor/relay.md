@@ -119,3 +119,11 @@ Timestamped entries for context continuity between sessions.
 - **Status:** Deployed `owui-surrealdb:v0.2.0-cascade` to Saturn. Found and fixed edge case: empty DB after cascade cleanup causes "database does not exist" on next write. Adapter now auto-reconnects.
 - **Decisions:** Treat "database does not exist" as reconnectable error (like transport errors) — reconnect re-issues USE ns/db which auto-creates the database
 - **Next:** Tag v0.2.0, upstream PR to Open WebUI, file OWUI delete bug (`delete()` vs `delete_collection()`)
+
+## 2026-10-14 00:45
+
+- **Session:** v0.5.0 — relocate, merge the two drifted copies, bench acceptance
+- **Tracks touched:** none (ran from a task brief)
+- **Status:** Repo moved from `~/SurrealDB/` to `~/Projects/` (old meta-folder backed up to `~/backups/SurrealDB-folder-2026-10-14.tar.gz`, removed); conductor upgraded to Orpheus v3.1. Dockerfile 0.11.3-cuda + hotpatches folded in, version 0.5.0, `purge_orphans()` auto-discovery dry-runs by default. Bench SurrealDB 3.1.2 → 3.2.4. 186 tests; bench checks a–f pass (`E2E_CHECKLIST.md`). Tagged v0.5.0, merged to main, pushed.
+- **Decisions:** bench SurrealDB mirrors Saturn (3.2.4); hold OWUI 0.12 until Saturn is on v0.5.0
+- **Next:** Saturn deploy of v0.5.0 (separate task)

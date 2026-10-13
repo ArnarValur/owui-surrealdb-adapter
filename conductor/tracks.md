@@ -1,30 +1,13 @@
-# Tracks Registry
+# Tracks — owui-surrealdb-adapter
 
-All tracks organized by domain. Each track links to its dedicated folder.
+> One line per track: `- {status emoji} **{track-id}** — {type}: {one-line state} → tracks/{domain}/{track-id}/plan.md`
+> Detail lives in the track's own folder, not here.
 
----
+## Active
 
-## Domain Structure
+- None.
 
-| Domain | Path | Caution Level |
-|--------|------|---------------|
-| integrations | `conductor/tracks/integrations/` | 🟡 Careful |
+## Done
 
----
-
-## Active Tracks
-
-_None._
-
-## Completed Tracks
-
-- [x] **Adapter Hardening v0.2.0 — First-KB bug, version fix, code audit**
-  - *Type:* bug | *Domain:* integrations | *Status:* completed
-  - *Link:* [tracks/integrations/adapter_hardening_v020_20260611/](./tracks/integrations/adapter_hardening_v020_20260611/)
-
-## Completed Tracks
-
-- [x] **owui-surrealdb-adapter v2 — Standalone adapter with Docker overlay**
-  - *Type:* feature | *Domain:* integrations | *Status:* completed
-  - *Link:* [tracks/integrations/owui_surrealdb_adapter_20260603/](./tracks/integrations/owui_surrealdb_adapter_20260603/)
-
+- ✅ **adapter_hardening_v020_20260611** — bug: first-KB fix, version alignment, code audit; tagged v0.2.0 → tracks/integrations/adapter_hardening_v020_20260611/plan.md
+- ✅ **owui_surrealdb_adapter_20260603** — feature: standalone adapter + Docker overlay, deployed to Saturn as v0.1.0 → tracks/integrations/owui_surrealdb_adapter_20260603/plan.md
