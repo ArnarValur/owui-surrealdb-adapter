@@ -157,3 +157,22 @@
 > - Mass upload (52 files) completed without issues — adapter handles concurrent inserts cleanly
 > - Retrieval is smart: different queries pull different source subsets from the same KB
 > - Per-file table caching is by OWUI design, not an adapter leak
+
+---
+
+## 2026-10-14 — v0.5.0 acceptance on the PlutoII bench ✅
+
+Image `owui-surrealdb:v0.5.0-cuda` (`09e282d50d76`, base `open-webui:0.11.3-cuda`, both hotpatches printed `patched:`), container `owui-pluto`, SurrealDB **3.2.4** (`pluto-surrealdb`, upgraded from 3.1.2 the same night). Unit + live suite: 186 passed on 3.2.4.
+
+| # | Check | Result | Evidence |
+|---|-------|--------|----------|
+| a | Real `VectorDBBase`, not the fallback | ✅ PASS | `c.VectorDBBase.__module__` → `open_webui.retrieval.vector.main` |
+| b | `ASYNC_VECTOR_DB_CLIENT.supports_hybrid_search` | ✅ PASS | `False`, no traceback (run with the server's `WEBUI_SECRET_KEY`; bare `python -c` exits on the missing key before importing anything of ours) |
+| c | Hybrid search ON, KB upload, cited answer | ✅ PASS | Folder upload into KB `12cf24c0…`: 30 files, 216 chunks, one `owui_file-*` table each; chat answered with file citations; `grep -i "native hybrid"` → empty |
+| d | Delete KB → KB table and its file tables gone | ✅ PASS | Cascade log: `dropped 30 orphaned file table(s)`; `INFO FOR DB` shows KB table + 0 of 30 file tables left |
+| e | Restart, first action deletes a KB file | ✅ PASS | After `docker restart`, first adapter lines: `Connected …` then `Deleted collection 'file-2689abb1…'`; table gone |
+| f | No adapter tracebacks | ✅ PASS | 0 tracebacks mentioning `owui_surrealdb_adapter`; 0 non-INFO adapter log lines |
+
+Notes:
+- One file in the folder upload was rejected by OWUI as duplicate content; OWUI had already created its `owui_file-dfff3e69…` table, which is left with no KB. OWUI behaviour, not the adapter — `purge_orphans()` (dry run by default) reports it.
+- Folder upload fails on `http://localhost:3000` ("Directory selection was cancelled"): localhost is a secure context, so OWUI uses `showDirectoryPicker`, which aborts on this desktop. Use the LAN/Tailscale address, where OWUI falls back to `<input webkitdirectory>`.
