@@ -13,4 +13,6 @@ Backups of both are kept as `*.bak` in the image. Separately, `hotpatches/` hold
 
 **Upstream.** OWUI PR #22287 (SurrealDB as a VectorDB) was refused by the maintainer over SurrealDB's BSL licence. The goal is a standalone overlay package, maintained here.
 
+**Bench SurrealDB.** 2026-10-14: `pluto-surrealdb` moved from v3.1.2 to **v3.2.4** to mirror Saturn (same container name, volume `docker_surrealdb-data`, `pluto-net`; set in `~/Docker/pluto-compose.yml`). Data intact (1332 tables in `owui/vectors`), 186/186 tests green on 3.2.4. Pre-upgrade volume backup: `~/backups/pluto-surrealdb-2026-10-14/`.
+
 **Open steps** live in `pulse.md` → Next queue.

@@ -1,14 +1,35 @@
 from __future__ import annotations
 
+from abc import ABC
 import logging
 import re
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel
 
 from owui_surrealdb_adapter.config import SurrealDBConfig
+
+try:
+    from open_webui.retrieval.vector.main import VectorDBBase
+except ImportError:
+
+    class VectorDBBase(ABC):  # type: ignore[no-redef]
+        """Fallback base class when open_webui is not installed."""
+
+        def hybrid_search(
+            self,
+            collection_name: str,
+            query: str,
+            vectors: list[list[Union[float, int]]],
+            filter: Optional[dict] = None,
+            limit: int = 10,
+            hybrid_bm25_weight: float = 0.5,
+        ) -> Optional[SearchResult]:
+            """Search using a backend-native hybrid keyword/vector implementation when available."""
+            return None
+
 
 log = logging.getLogger(__name__)
 
@@ -110,18 +131,18 @@ def _is_db_missing(exc: Exception) -> bool:
 def _is_not_found(exc: Exception) -> bool:
     """Check if an exception is a SurrealDB 'table not found' error.
 
-    Checks both the exception class name and message content for robustness
-    across SDK versions. Excludes database/namespace-level errors which
-    require reconnection (handled by _is_db_missing).
+    Checks both the exception class name and table-level message content for
+    robustness across SDK versions. Excludes database/namespace-level errors
+    (handled by _is_db_missing) and non-table 'does not exist' errors (e.g.
+    index, field, function, or parameter errors).
     """
     if _is_db_missing(exc):
         return False  # Don't swallow — needs reconnect, not a no-op
     cls = type(exc).__name__
     msg = str(exc).lower()
     return (
-        cls == "NotFoundError"
-        or "does not exist" in msg
-        or "table not found" in msg
+        cls == "TableNotFoundError"
+        or ("table" in msg and ("does not exist" in msg or "not found" in msg))
     )
 
 
@@ -137,7 +158,7 @@ def _is_transport_error(exc: Exception) -> bool:
     )
 
 
-class SurrealDBClient:
+class SurrealDBClient(VectorDBBase):
     """SurrealDB vector database adapter for Open WebUI.
 
     Implements the VectorDBBase interface (9 methods):
@@ -159,6 +180,7 @@ class SurrealDBClient:
         self.client: Any = None  # surrealdb.Surreal instance
         self._surreal_ctx: Any = None  # context manager reference
         self._lock = threading.Lock()
+        self._conn_generation: int = 0
         log.info(
             "SurrealDBClient initialized (uri=%s, ns=%s, db=%s, prefix=%s, index=%s)",
             self.config.uri,
@@ -195,6 +217,19 @@ class SurrealDBClient:
         """Return the table name with the configured prefix."""
         return f"{self.config.table_prefix}{collection_name}"
 
+    def _get_client(self) -> Any:
+        """Return a local reference to the active client under lock.
+
+        Ensures a concurrent _force_reconnect() or close() setting
+        self.client = None cannot cause an AttributeError between checking
+        and calling query_raw().
+        """
+        with self._lock:
+            client = self.client
+        if client is None:
+            raise ConnectionError("SurrealDB client is not connected")
+        return client
+
     def _execute_query(
         self, query: str, params: dict[str, Any] | None = None
     ) -> list[Any]:
@@ -211,7 +246,8 @@ class SurrealDBClient:
         """
         from surrealdb.errors import parse_query_error, parse_rpc_error
 
-        response = self.client.query_raw(query, params)
+        client = self._get_client()
+        response = client.query_raw(query, params)
 
         # Check for top-level RPC/transport error first
         error = response.get("error")
@@ -235,8 +271,11 @@ class SurrealDBClient:
         """
         last_exc: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
+            gen_before: int | None = None
             try:
                 self._ensure_connected()
+                with self._lock:
+                    gen_before = self._conn_generation
                 return self._execute_query(query, params)
             except Exception as exc:
                 if _is_transport_error(exc) or _is_db_missing(exc):
@@ -248,7 +287,7 @@ class SurrealDBClient:
                         self.config.max_retries + 1,
                         exc,
                     )
-                    self._force_reconnect()
+                    self._force_reconnect(expected_generation=gen_before)
                     if attempt < self.config.max_retries:
                         wait = self.config.retry_backoff * (2 ** attempt)
                         time.sleep(wait)
@@ -264,13 +303,16 @@ class SurrealDBClient:
         from surrealdb import Surreal
 
         surreal = Surreal(self.config.uri)
-        # Enter context manager — opens WebSocket or HTTP connection
+        # Enter context manager — opens WebSocket or HTTP connection.
+        # NOTE: the SDK (surrealdb 2.0.0) hardcodes websockets' 10 s open_timeout;
+        # SURREALDB_CONNECT_TIMEOUT cannot be applied without patching the SDK.
         conn = surreal.__enter__()
         self._surreal_ctx = surreal  # keep reference to avoid GC closing it
 
         conn.signin({"username": self.config.user, "password": self.config.password})
         conn.use(self.config.namespace, self.config.database)
         self.client = conn
+        self._conn_generation += 1
 
         log.info(
             "Connected to SurrealDB at %s (ns=%s, db=%s)",
@@ -281,18 +323,30 @@ class SurrealDBClient:
 
     def _ensure_connected(self) -> None:
         """Ensure a live connection to SurrealDB exists (thread-safe)."""
-        if self.client is not None:
-            return
         with self._lock:
-            # Double-check after acquiring lock — another thread may have
-            # connected (or close() may have run) between our first check
-            # and acquiring the lock.
             if self.client is None:
                 self._connect()
 
-    def _force_reconnect(self) -> None:
-        """Close existing connection and reconnect (thread-safe)."""
+    def _force_reconnect(self, expected_generation: int | None = None) -> None:
+        """Close existing connection and reconnect (thread-safe).
+
+        If expected_generation is provided and another thread has already
+        advanced _conn_generation (and self.client is live), skips redundant
+        reconnection to prevent a reconnect herd.
+        """
         with self._lock:
+            if (
+                expected_generation is not None
+                and self._conn_generation != expected_generation
+                and self.client is not None
+            ):
+                log.debug(
+                    "Skipping redundant reconnect (generation %d -> %d already active)",
+                    expected_generation,
+                    self._conn_generation,
+                )
+                return
+
             # Close old connection
             if self._surreal_ctx is not None:
                 try:
@@ -377,6 +431,7 @@ class SurrealDBClient:
         'table:key' → 'key', RecordID → str(key)
         Strips all SurrealDB ID wrapping formats:
         - ⟨⟩ brackets (IDs with hyphens/special chars)
+        - `` backticks (SurrealQL escaped IDs)
         - { } object-based record IDs
         - [ ] array-based record IDs
         """
@@ -385,6 +440,9 @@ class SurrealDBClient:
             s = s.split(":", 1)[1]
         # Strip ⟨⟩ brackets that SurrealDB adds for IDs with hyphens/special chars
         if s.startswith("⟨") and s.endswith("⟩"):
+            s = s[1:-1]
+        # Strip backticks for backtick-escaped record IDs
+        elif s.startswith("`") and s.endswith("`"):
             s = s[1:-1]
         # Strip { } for object-based record IDs
         elif s.startswith("{") and s.endswith("}"):
@@ -408,9 +466,8 @@ class SurrealDBClient:
         Uses INFO FOR TABLE to check for fields or indexes.
         Only catches table-not-found errors — network/auth errors propagate.
         """
-        if not self.client:
-            return False
         try:
+            self._ensure_connected()
             _validate_name(collection_name, "collection_name")
             table = self._prefixed(collection_name)
             results = self._execute_with_retry(f"INFO FOR TABLE `{table}`;")
@@ -445,8 +502,8 @@ class SurrealDBClient:
         """Find and drop file tables orphaned by deleting this KB collection.
 
         1. Query the KB table for all distinct metadata.file_id values.
-        2. For each file_id, check if any OTHER KB collection also references it.
-        3. Drop unreferenced file tables.
+        2. Query each OTHER KB collection once for its distinct metadata.file_id values.
+        3. Drop file tables from (1) that are not in the active set from (2).
 
         Returns list of dropped table names.
         """
@@ -473,6 +530,8 @@ class SurrealDBClient:
 
         # Filter out None/empty values
         file_ids = [fid for fid in file_ids if fid]
+        if not file_ids:
+            return dropped
 
         log.info(
             "Cascade delete: KB '%s' references %d file(s), checking for orphans...",
@@ -496,7 +555,23 @@ class SurrealDBClient:
             and self._is_kb_collection(t[len(prefix):])
         ]
 
-        # Step 3: For each file_id, check if referenced in any other KB
+        # Collect active file_ids referenced by any other KB (one query per other KB)
+        referenced_file_ids: set[str] = set()
+        for other_table in other_kb_tables:
+            try:
+                other_res = self._execute_with_retry(
+                    f"SELECT array::distinct(metadata.file_id) AS file_ids "
+                    f"FROM `{other_table}` GROUP ALL;"
+                )
+                other_rows = other_res[0] if other_res else []
+                if other_rows and other_rows[0]:
+                    for fid in other_rows[0].get("file_ids", []) or []:
+                        if fid:
+                            referenced_file_ids.add(fid)
+            except Exception:
+                continue  # Skip inaccessible tables
+
+        # Step 3: For each file_id in the deleted KB, drop if not in referenced_file_ids
         for file_id in file_ids:
             try:
                 _validate_name(file_id, "file_id")
@@ -509,23 +584,7 @@ class SurrealDBClient:
             if file_table not in all_tables:
                 continue
 
-            # Check if any other KB references this file
-            referenced = False
-            for other_table in other_kb_tables:
-                try:
-                    check = self._execute_with_retry(
-                        f"SELECT count() AS cnt FROM `{other_table}` "
-                        f"WHERE metadata.file_id = $fid GROUP ALL;",
-                        {"fid": file_id},
-                    )
-                    rows = check[0] if check else []
-                    if rows and rows[0].get("cnt", 0) > 0:
-                        referenced = True
-                        break
-                except Exception:
-                    continue  # Skip inaccessible tables
-
-            if not referenced:
+            if file_id not in referenced_file_ids:
                 try:
                     self._execute_with_retry(f"REMOVE TABLE IF EXISTS `{file_table}`;")
                     dropped.append(file_table)
@@ -596,6 +655,8 @@ class SurrealDBClient:
 
         if not items:
             return
+
+        items = [i.model_dump() if hasattr(i, "model_dump") else i for i in items]
 
         # Auto-create collection if needed (including metadata-only with dim=0)
         if not self.has_collection(collection_name):
@@ -675,7 +736,7 @@ class SurrealDBClient:
 
             ef = _validate_limit(self.config.ef_search)
             query = (
-                f"SELECT *, vector::distance::knn() AS dist "
+                f"SELECT id, content, metadata, vector::distance::knn() AS dist "
                 f"FROM `{table}` "
                 f"WHERE embedding <|{limit},{ef}|> $qv "
                 f"{('AND ' + ' AND '.join(where_parts) + ' ') if where_parts else ''}"
@@ -732,7 +793,7 @@ class SurrealDBClient:
         where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
         limit_clause = f" LIMIT {_validate_limit(limit)}" if limit else ""
 
-        query = f"SELECT * FROM `{table}` {where_clause}{limit_clause};"
+        query = f"SELECT id, content, metadata FROM `{table}` {where_clause}{limit_clause};"
 
         try:
             results = self._execute_with_retry(query, params)
@@ -767,7 +828,9 @@ class SurrealDBClient:
         table = self._prefixed(collection_name)
 
         try:
-            results = self._execute_with_retry(f"SELECT * FROM `{table}`;")
+            results = self._execute_with_retry(
+                f"SELECT id, content, metadata FROM `{table}`;"
+            )
             rows = results[0] if results else []
         except Exception as e:
             if _is_not_found(e):
@@ -860,7 +923,7 @@ class SurrealDBClient:
     def purge_orphans(
         self,
         active_file_ids: set[str] | None = None,
-        dry_run: bool = False,
+        dry_run: bool | None = None,
     ) -> list[str]:
         """Drop file tables not referenced by any KB collection.
 
@@ -869,10 +932,19 @@ class SurrealDBClient:
                 If None, auto-discovers by scanning all KB collections
                 for metadata.file_id values.
             dry_run: If True, return orphan list without dropping.
+                Defaults to True in auto-discovery mode and False when
+                ``active_file_ids`` is given. Auto-discovery only sees
+                files that belong to a KB, so files uploaded straight
+                into a chat (``file-{id}`` tables with no KB) look like
+                orphans; pass ``dry_run=False`` only when you know none
+                of those need keeping.
 
         Returns:
             List of dropped (or would-be-dropped) table names.
         """
+        if dry_run is None:
+            dry_run = active_file_ids is None
+
         self._ensure_connected()
 
         # Get all tables

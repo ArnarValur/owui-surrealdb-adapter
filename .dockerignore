@@ -7,3 +7,12 @@ __pycache__
 tests/
 *.pyc
 htmlcov/
+
+# Secrets and backups — the Dockerfile does COPY ., so these would land in an image layer
+.env
+.env.*
+*.bak
+
+# Dev-only folders
+conductor/
+.claude/

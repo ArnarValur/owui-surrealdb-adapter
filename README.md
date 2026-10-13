@@ -10,11 +10,11 @@ This is an attempt to do just that. But with a small twist. Im hoping maybe I ca
 
 ### Docker (recommended)
 
-The adapter ships as a Docker overlay — it extends the official Open WebUI image, no fork needed.
+The adapter ships as a Docker overlay — it extends the official Open WebUI image (`ghcr.io/open-webui/open-webui:0.11.3-cuda`), no fork needed. The image build also applies two Gemini streaming fixes from `hotpatches/` to Open WebUI itself.
 
 ```bash
 # Clone and start
-git clone https://github.com/merkurial-studio/owui-surrealdb-adapter.git
+git clone https://github.com/ArnarValur/owui-surrealdb-adapter.git
 cd owui-surrealdb-adapter
 
 # Set credentials (change for production!)
@@ -51,9 +51,10 @@ All settings are via environment variables with sensible defaults:
 | `SURREALDB_TABLE_PREFIX` | `owui_` | Prefix for all vector tables |
 | `SURREALDB_INDEX_TYPE` | `hnsw` | Vector index type (`hnsw` or `diskann`) |
 | `SURREALDB_EF_SEARCH` | `40` | KNN search effort (higher = more accurate, slower) |
-| `SURREALDB_CONNECT_TIMEOUT` | `10` | Connection timeout in seconds |
+| `SURREALDB_CONNECT_TIMEOUT` | `10` | Currently ignored — the SDK hardcodes a 10 s open timeout |
 | `SURREALDB_MAX_RETRIES` | `3` | Max reconnection attempts on transport failure |
 | `SURREALDB_RETRY_BACKOFF` | `1.0` | Base backoff delay between retries (seconds, doubles each retry) |
+| `SURREALDB_CASCADE_DELETE` | `true` | When a knowledge base is deleted, also drop the file tables only it used |
 
 ## How It Works
 
@@ -66,7 +67,7 @@ The adapter patches two files inside Open WebUI at build time:
 - **type.py** — adds `SURREALDB` to the `VectorType` enum
 - **factory.py** — adds a `case VectorType.SURREALDB:` branch to the factory
 
-At runtime, when `VECTOR_DB=surrealdb`, OWUI routes all vector operations through `SurrealDBClient`, which implements all 7 `VectorDBBase` methods: `has_collection`, `insert`, `upsert`, `search`, `query`, `get`, `delete`, `delete_collection`, and `reset`.
+At runtime, when `VECTOR_DB=surrealdb`, OWUI routes all vector operations through `SurrealDBClient`, which implements all 9 `VectorDBBase` methods: `has_collection`, `insert`, `upsert`, `search`, `query`, `get`, `delete`, `delete_collection`, and `reset`.
 
 Each knowledge base file gets its own SurrealDB table (`owui_file-{uuid}`) with HNSW-indexed vectors for fast KNN search.
 
@@ -77,9 +78,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 # Run unit + hardening tests (no SurrealDB needed)
-pytest tests/ --ignore=tests/test_live_integration.py
+pytest tests/ --ignore=tests/test_live_integration.py \
+  --ignore=tests/test_cascade_delete.py --ignore=tests/test_metadata_collections.py
 
-# Run ALL tests including live integration (needs SurrealDB on localhost:8000)
+# Run ALL tests including live integration (needs SurrealDB on localhost:8000,
+# or set TEST_SURREALDB_URI). test_live_integration.py, test_cascade_delete.py
+# and test_metadata_collections.py all need a live SurrealDB.
 pytest tests/
 ```
 
@@ -90,17 +94,16 @@ pytest tests/
 | `type::thing is not a valid function` | SurrealDB v3.1 renamed it | Already fixed — adapter uses `DELETE table:id` syntax |
 | `table does not exist` on first query | Table created lazily on insert | Upload a file first, then query |
 | Connection drops after idle | WebSocket timeout | Adapter auto-reconnects with exponential backoff |
-| `FLEXIBLE TYPE object` parse error | SurrealQL v3.1 syntax change | Already fixed — uses `TYPE option<object>` |
 | Dimension mismatch after model change | Old vectors have different size | Delete and re-upload affected knowledge bases |
 
 ## Status
 
 - ✅ All 9 VectorDBBase methods implemented
 - ✅ Production hardened — SQL injection prevention, reconnect logic, thread safety
-- ✅ 149 tests passing (67 unit + 57 hardening + 25 live integration)
-- ✅ Docker overlay — extends OWUI 0.9.6, no fork needed
+- ✅ 186 tests passing (unit, hardening and live integration)
+- ✅ Docker overlay — extends OWUI 0.11.3-cuda, no fork needed
 - ✅ Full RAG pipeline verified: upload → embed → HNSW → KNN search → cited answer
-- 🔜 Upstream PR to Open WebUI (goal: official adapter)
+- ❌ Upstream: Open WebUI PR #22287 (SurrealDB as a VectorDB) was refused by the maintainer over SurrealDB's BSL licence. The goal is now a standalone overlay package, maintained here.
 
 ## License
 

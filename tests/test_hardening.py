@@ -150,7 +150,10 @@ class TestIsNotFound:
     def test_not_found_error_class(self):
         class NotFoundError(Exception):
             pass
-        assert _is_not_found(NotFoundError("something"))
+        # SurrealDB 3.x: NotFoundError("The table 'x' does not exist")
+        assert _is_not_found(NotFoundError("The table 'x' does not exist"))
+        # A NotFoundError about something other than a table is NOT a missing table
+        assert _is_not_found(NotFoundError("something")) is False
 
     def test_generic_error_is_not_not_found(self):
         assert _is_not_found(Exception("connection refused")) is False

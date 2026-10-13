@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import os
+from importlib.metadata import version
 
 from owui_surrealdb_adapter import __version__, SurrealDBClient
 from owui_surrealdb_adapter.config import SurrealDBConfig
 
 
 def test_version():
-    assert __version__ == "2.0.0"
+    assert __version__ == "0.5.0"
+
+
+def test_version_matches_pyproject():
+    """__init__.py and pyproject.toml once drifted (2.0.0 vs 0.2.0)."""
+    assert __version__ == version("owui-surrealdb-adapter")
 
 
 def test_config_defaults():

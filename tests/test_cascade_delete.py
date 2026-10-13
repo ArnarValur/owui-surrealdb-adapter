@@ -274,8 +274,8 @@ class TestPurgeOrphans:
         # Only active_file is in a KB
         _insert_kb_items(cascade_client, kb_id, [active_file])
 
-        # Purge orphans (auto-discovery)
-        dropped = cascade_client.purge_orphans()
+        # Purge orphans (auto-discovery, explicit opt-in to dropping)
+        dropped = cascade_client.purge_orphans(dry_run=False)
 
         # orphan_file should be dropped
         prefix = cascade_client.config.table_prefix
@@ -283,6 +283,27 @@ class TestPurgeOrphans:
         assert not cascade_client.has_collection(f"file-{orphan_file}")
         # active_file should survive
         assert cascade_client.has_collection(f"file-{active_file}")
+
+    def test_purge_auto_discovery_defaults_to_dry_run(
+        self, cascade_client: SurrealDBClient
+    ):
+        """Auto-discover mode without dry_run keeps tables: a chat-uploaded
+        file has a file-{id} table but belongs to no KB."""
+        kb_id = str(uuid.uuid4())
+        kb_file = str(uuid.uuid4())
+        chat_file = str(uuid.uuid4())
+
+        _insert_file_items(cascade_client, kb_file)
+        _insert_file_items(cascade_client, chat_file)
+        _insert_kb_items(cascade_client, kb_id, [kb_file])
+
+        reported = cascade_client.purge_orphans()
+
+        prefix = cascade_client.config.table_prefix
+        assert reported == [f"{prefix}file-{chat_file}"]
+        # Reported only — nothing dropped
+        assert cascade_client.has_collection(f"file-{chat_file}")
+        assert cascade_client.has_collection(f"file-{kb_file}")
 
     def test_purge_with_active_ids(self, cascade_client: SurrealDBClient):
         """Explicit active_file_ids set: only unlisted file tables are dropped."""

@@ -8,7 +8,7 @@
 
 - Canonical repo: `~/Projects/owui-surrealdb-adapter` (moved from `~/SurrealDB/` 2026-10-14). Tags `v0.1.0`, `v0.2.0`.
 - Saturn still runs `owui-surrealdb:v0.4.x-cuda`, built from the old copy `~/Saturn/owui-surrealdb-adapter/` (marked DEPRECATED, kept until Saturn is on v0.5.0).
-- PlutoII test bench: `~/Saturn/docker/owui-pluto/docker-compose.yml` → container `owui-pluto` (port 3000) + `pluto-surrealdb` (SurrealDB 3.1.2, host port 8000, root/root).
+- PlutoII test bench: `~/Saturn/docker/owui-pluto/docker-compose.yml` → container `owui-pluto` (port 3000) + `pluto-surrealdb` (SurrealDB **3.2.4** since 2026-10-14, was 3.1.2; host port 8000, root/root; compose `~/Docker/pluto-compose.yml`).
 - Old pulse (June state) archived: `pulse-archive/pulse-2026-06-11.md`.
 
 ## 🚀 Active tracks
